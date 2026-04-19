@@ -1,0 +1,46 @@
+Dataset keys: ['trajectories', 'starts', 'goals', 'curve_strengths', 'curve_directions']
+Trajectories shape: (500, 60, 2)
+Single trajectory shape: (60, 2)
+
+Example 0
+  Start: [0.74908024 1.9014286 ]
+  Goal: [9.463988 9.197317]
+  Curve strength: 0.35601863
+  Curve direction: -1.0
+  First 3 points:
+[[0.74908024 1.9014286 ]
+ [0.89567524 2.0043762 ]
+ [1.0615534  2.1221929 ]]
+  Last 3 points:
+[[9.180169  8.908645 ]
+ [9.344742  9.0742035]
+ [9.463988  9.197317 ]]
+
+Example 1
+  Start: [0.6901425 1.2687027]
+  Goal: [9.361411 9.06187 ]
+  Curve strength: 0.64778316
+  Curve direction: 1.0
+  First 3 points:
+[[0.6901425  1.2687027 ]
+ [0.80243754 1.4380296 ]
+ [0.9260306  1.6048499 ]]
+  Last 3 points:
+[[9.029688 8.829843]
+ [9.22723  8.983075]
+ [9.361411 9.06187 ]]
+
+Example 2
+  Start: [1.9517041 1.0326006]
+  Goal: [8.645913 9.590372]
+  Curve strength: 0.47083226
+  Curve direction: 1.0
+  First 3 points:
+[[1.9517041 1.0326006]
+ [2.0721474 1.1829258]
+ [2.1159751 1.3483826]]
+  Last 3 points:
+[[8.392351 9.342638]
+ [8.521035 9.471763]
+ [8.645913 9.590372]]
+
