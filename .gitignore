@@ -22,13 +22,5 @@ env/
 .pytest_cache/
 .ipynb_checkpoints/
 
-# Model outputs and checkpoints
-outputs/
-checkpoints/
-
-*.pth
-*.pt
-*.ckpt
-
 # Logs
 *.log
