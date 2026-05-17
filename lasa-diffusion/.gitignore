@@ -16,11 +16,12 @@ env/
 .env/
 
 # Outputs & checkpoints
-outputs/
 checkpoints/
 *.pth
 *.pt
 *.ckpt
+!outputs/
+!outputs/**
 
 # Jupyter
 .ipynb_checkpoints/
