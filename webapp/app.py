@@ -1,0 +1,765 @@
+from pathlib import Path
+import importlib.util
+import io
+import os
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "lasa-diffusion" / ".mplconfig"))
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+try:
+    from streamlit_drawable_canvas import st_canvas
+except ImportError:
+    st_canvas = None
+
+DIFFUSION_DIR = ROOT / "lasa-diffusion"
+sys.path.insert(0, str(DIFFUSION_DIR))
+
+from dataset import LASATrajectoryDataset  # noqa: E402
+
+
+def load_generate_samples():
+    for module_name in ["sample", "model", "diffusion"]:
+        sys.modules.pop(module_name, None)
+
+    spec = importlib.util.spec_from_file_location("lasa_diffusion_sample_runtime", DIFFUSION_DIR / "sample.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.generate_samples
+
+
+generate_samples = load_generate_samples()
+
+
+DEFAULT_CHECKPOINT = DIFFUSION_DIR / "outputs" / "lasa_diffusion.pt"
+CANVAS_SIZE = 420
+SPEED_PRESETS = {
+    "Fast": 50,
+    "Balanced": 250,
+    "Full": 1000,
+}
+SHAPE_OPTIONS = [
+    "Angle",
+    "BendedLine",
+    "CShape",
+    "DoubleBendedLine",
+    "GShape",
+    "heee",
+    "JShape",
+    "JShape_2",
+    "Khamesh",
+    "Leaf_1",
+    "Leaf_2",
+    "Line",
+    "LShape",
+    "NShape",
+    "PShape",
+    "RShape",
+    "Saeghe",
+    "Sharpc",
+    "Sine",
+    "Snake",
+    "Spoon",
+    "Sshape",
+    "Trapezoid",
+    "Worm",
+    "WShape",
+    "Zshape",
+]
+
+
+st.set_page_config(page_title="SWE 599 Trajectory Diffusion Demo", layout="wide")
+
+
+def list_checkpoints():
+    checkpoints = sorted(DIFFUSION_DIR.glob("outputs/**/*.pt"))
+
+    def checkpoint_priority(path):
+        if "temporal_conv_metrics" in path.parts:
+            return (0, str(path))
+        if "temporal_conv" in path.parts:
+            return (1, str(path))
+        if "start_goal" in path.parts:
+            return (2, str(path))
+        return (3, str(path))
+
+    checkpoints = sorted(checkpoints, key=checkpoint_priority)
+    if DEFAULT_CHECKPOINT.exists() and DEFAULT_CHECKPOINT not in checkpoints:
+        checkpoints.insert(0, DEFAULT_CHECKPOINT)
+    return checkpoints
+
+
+@st.cache_data(show_spinner=False)
+def load_reference_trajectories(shape_name, seq_len):
+    dataset = LASATrajectoryDataset(shape_name=shape_name, seq_len=seq_len)
+    raw = dataset.data * dataset.std + dataset.mean
+    return raw.astype(np.float32)
+
+
+def extract_drawn_points(canvas_json):
+    if not canvas_json:
+        return None
+
+    points = []
+    for obj in canvas_json.get("objects", []):
+        if obj.get("type") == "path":
+            for command in obj.get("path", []):
+                numeric_values = [value for value in command[1:] if isinstance(value, (int, float))]
+                if len(numeric_values) >= 2:
+                    points.append(numeric_values[-2:])
+        elif obj.get("type") == "line":
+            points.extend([[obj.get("x1", 0), obj.get("y1", 0)], [obj.get("x2", 0), obj.get("y2", 0)]])
+        elif obj.get("type") in {"polyline", "polygon"}:
+            for point in obj.get("points", []):
+                points.append([point.get("x", 0) + obj.get("left", 0), point.get("y", 0) + obj.get("top", 0)])
+
+    if len(points) < 2:
+        return None
+
+    points = np.asarray(points, dtype=np.float32)
+    points[:, 1] = CANVAS_SIZE - points[:, 1]
+    return points
+
+
+def resample_points(points, seq_len):
+    if points is None or len(points) < 2:
+        return None
+
+    deltas = np.diff(points, axis=0)
+    segment_lengths = np.linalg.norm(deltas, axis=1)
+    distances = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+
+    if distances[-1] == 0:
+        return np.repeat(points[:1], seq_len, axis=0)
+
+    target = np.linspace(0.0, distances[-1], seq_len)
+    x = np.interp(target, distances, points[:, 0])
+    y = np.interp(target, distances, points[:, 1])
+    return np.stack([x, y], axis=-1)
+
+
+def map_drawing_to_sample_space(drawing, samples):
+    drawing_min = drawing.min(axis=0)
+    drawing_span = np.maximum(drawing.max(axis=0) - drawing_min, 1e-6)
+    drawing_unit = (drawing - drawing_min) / drawing_span
+
+    sample_min = samples.min(axis=(0, 1))
+    sample_span = np.maximum(samples.max(axis=(0, 1)) - sample_min, 1e-6)
+    return drawing_unit * sample_span + sample_min
+
+
+def apply_drawing_guidance(samples, drawing, strength):
+    if drawing is None or strength <= 0:
+        return samples, None
+
+    guide = map_drawing_to_sample_space(drawing, samples)
+    guided = ((1.0 - strength) * samples) + (strength * guide[None, :, :])
+    return guided, guide
+
+
+def apply_start_goal_guidance(samples, start_goal, strength):
+    if start_goal is None or strength <= 0:
+        return samples
+
+    start = np.asarray(start_goal[:2], dtype=np.float32)
+    goal = np.asarray(start_goal[2:], dtype=np.float32)
+    weights = np.linspace(0.0, 1.0, samples.shape[1], dtype=np.float32).reshape(1, -1, 1)
+    target_line = ((1.0 - weights) * start.reshape(1, 1, 2)) + (weights * goal.reshape(1, 1, 2))
+
+    correction_start = start.reshape(1, 1, 2) - samples[:, :1, :]
+    correction_goal = goal.reshape(1, 1, 2) - samples[:, -1:, :]
+    correction = ((1.0 - weights) * correction_start) + (weights * correction_goal)
+    endpoint_guided = samples + correction
+
+    return ((1.0 - strength) * samples) + (strength * (0.85 * endpoint_guided + 0.15 * target_line))
+
+
+def trajectory_smoothness(trajectories):
+    second_diff = np.diff(trajectories, n=2, axis=1)
+    return float(np.mean(np.linalg.norm(second_diff, axis=2)))
+
+
+def mean_curvature(trajectories):
+    velocity = np.diff(trajectories, axis=1)
+    acceleration = np.diff(velocity, axis=1)
+    speed = np.linalg.norm(velocity[:, 1:, :], axis=2)
+    cross = np.abs(
+        velocity[:, 1:, 0] * acceleration[:, :, 1]
+        - velocity[:, 1:, 1] * acceleration[:, :, 0]
+    )
+    curvature = cross / np.maximum(speed**3, 1e-6)
+    return float(np.mean(curvature))
+
+
+def nearest_reference_distance(samples, references):
+    if references is None or len(references) == 0:
+        return None
+
+    if references.shape[1] != samples.shape[1]:
+        resampled_references = [resample_points(trajectory, samples.shape[1]) for trajectory in references]
+        references = np.stack([trajectory for trajectory in resampled_references if trajectory is not None])
+        if len(references) == 0:
+            return None
+
+    sample_flat = samples.reshape(samples.shape[0], -1)
+    ref_flat = references.reshape(references.shape[0], -1)
+    distances = np.linalg.norm(sample_flat[:, None, :] - ref_flat[None, :, :], axis=2)
+    return float(np.mean(np.min(distances, axis=1)))
+
+
+def endpoint_error(samples, start_goal):
+    if start_goal is None:
+        return None
+
+    start = np.asarray(start_goal[:2], dtype=np.float32)
+    goal = np.asarray(start_goal[2:], dtype=np.float32)
+    start_error = np.linalg.norm(samples[:, 0, :] - start.reshape(1, 2), axis=1)
+    goal_error = np.linalg.norm(samples[:, -1, :] - goal.reshape(1, 2), axis=1)
+    return float(np.mean((start_error + goal_error) / 2.0))
+
+
+def trajectories_to_dataframe(trajectories, source):
+    rows = []
+    for sample_idx, trajectory in enumerate(trajectories):
+        for t, point in enumerate(trajectory):
+            rows.append(
+                {
+                    "source": source,
+                    "sample": sample_idx,
+                    "t": t,
+                    "x": float(point[0]),
+                    "y": float(point[1]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def dataframe_info(dataframe):
+    memory_mb = dataframe.memory_usage(deep=True).sum() / (1024 * 1024)
+    return pd.DataFrame(
+        [
+            {"item": "rows", "value": len(dataframe)},
+            {"item": "columns", "value": len(dataframe.columns)},
+            {"item": "samples", "value": dataframe["sample"].nunique()},
+            {"item": "time steps per sample", "value": dataframe["t"].nunique()},
+            {"item": "x min", "value": dataframe["x"].min()},
+            {"item": "x max", "value": dataframe["x"].max()},
+            {"item": "y min", "value": dataframe["y"].min()},
+            {"item": "y max", "value": dataframe["y"].max()},
+            {"item": "memory MB", "value": round(memory_mb, 4)},
+        ]
+    )
+
+
+def trajectory_summary_dataframe(trajectories, source):
+    rows = []
+    for sample_idx, trajectory in enumerate(trajectories):
+        segment_lengths = np.linalg.norm(np.diff(trajectory, axis=0), axis=1)
+        displacement = np.linalg.norm(trajectory[-1] - trajectory[0])
+        rows.append(
+            {
+                "source": source,
+                "sample": sample_idx,
+                "points": len(trajectory),
+                "start_x": float(trajectory[0, 0]),
+                "start_y": float(trajectory[0, 1]),
+                "goal_x": float(trajectory[-1, 0]),
+                "goal_y": float(trajectory[-1, 1]),
+                "path_length": float(segment_lengths.sum()),
+                "displacement": float(displacement),
+                "x_profile": trajectory[:, 0].round(3).tolist(),
+                "y_profile": trajectory[:, 1].round(3).tolist(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def visual_table_config():
+    return {
+        "x_profile": st.column_config.LineChartColumn(
+            "x over time",
+            help="Mini chart of the x-coordinate across trajectory timesteps.",
+            width="medium",
+        ),
+        "y_profile": st.column_config.LineChartColumn(
+            "y over time",
+            help="Mini chart of the y-coordinate across trajectory timesteps.",
+            width="medium",
+        ),
+        "path_length": st.column_config.NumberColumn("path length", format="%.2f"),
+        "displacement": st.column_config.NumberColumn("displacement", format="%.2f"),
+        "start_x": st.column_config.NumberColumn("start x", format="%.2f"),
+        "start_y": st.column_config.NumberColumn("start y", format="%.2f"),
+        "goal_x": st.column_config.NumberColumn("goal x", format="%.2f"),
+        "goal_y": st.column_config.NumberColumn("goal y", format="%.2f"),
+    }
+
+
+def plot_dataframe_preview(trajectories, title, color):
+    fig, ax = plt.subplots(figsize=(5, 4))
+    for trajectory in trajectories:
+        ax.plot(trajectory[:, 0], trajectory[:, 1], color=color, alpha=0.75, linewidth=1.8)
+    ax.set_title(title)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    return fig
+
+
+def checkpoint_history(metadata):
+    train_loss = metadata.get("train_losses") or metadata.get("losses") or []
+    return {
+        "loss": {
+            "train": train_loss,
+            "validation": metadata.get("val_losses") or [],
+            "title": "Noise Prediction Loss",
+            "ylabel": "MSE",
+        },
+        "accuracy": {
+            "train": metadata.get("train_accuracy") or [],
+            "validation": metadata.get("val_accuracy") or [],
+            "title": "Noise Direction Accuracy",
+            "ylabel": "accuracy",
+        },
+        "f1": {
+            "train": metadata.get("train_f1") or [],
+            "validation": metadata.get("val_f1") or [],
+            "title": "Noise Direction F1 Score",
+            "ylabel": "F1",
+        },
+    }
+
+
+def metric_history_dataframe(history):
+    rows = []
+    for metric_name, metric_data in history.items():
+        for split_name in ["train", "validation"]:
+            values = metric_data[split_name]
+            for epoch, value in enumerate(values):
+                rows.append(
+                    {
+                        "metric": metric_name,
+                        "split": split_name,
+                        "epoch": epoch,
+                        "value": float(value),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def plot_metric_history(metric_data):
+    fig, ax = plt.subplots(figsize=(7, 3.6))
+    has_data = False
+
+    if metric_data["train"]:
+        ax.plot(metric_data["train"], label="training", color="#2563eb", linewidth=2)
+        has_data = True
+
+    if metric_data["validation"]:
+        ax.plot(metric_data["validation"], label="validation", color="#ef4444", linewidth=2)
+        has_data = True
+
+    ax.set_title(metric_data["title"])
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(metric_data["ylabel"])
+    ax.grid(True, alpha=0.25)
+    if has_data:
+        ax.legend(loc="best")
+    else:
+        ax.text(0.5, 0.5, "Not available in this checkpoint", ha="center", va="center", transform=ax.transAxes)
+    fig.tight_layout()
+    return fig
+
+
+def final_metric_value(values):
+    return values[-1] if values else None
+
+
+def samples_to_csv(samples):
+    return trajectories_to_dataframe(samples, "generated").to_csv(index=False).encode("utf-8")
+
+
+def figure_to_png(fig):
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight")
+    buffer.seek(0)
+    return buffer
+
+
+def plot_trajectories(samples, references, guide, show_references, fixed_limits):
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    if show_references and references is not None:
+        for idx, trajectory in enumerate(references):
+            label = "real LASA" if idx == 0 else None
+            ax.plot(trajectory[:, 0], trajectory[:, 1], color="#94a3b8", linewidth=1.5, alpha=0.7, label=label)
+
+    for idx, trajectory in enumerate(samples):
+        label = "generated" if idx == 0 else None
+        ax.plot(trajectory[:, 0], trajectory[:, 1], color="#2563eb", linewidth=2, alpha=0.85, label=label)
+
+    if guide is not None:
+        ax.plot(guide[:, 0], guide[:, 1], color="black", linewidth=3, linestyle="--", label="drawn guide")
+
+    if fixed_limits:
+        all_parts = [samples.reshape(-1, 2)]
+        if show_references and references is not None:
+            all_parts.append(references.reshape(-1, 2))
+        if guide is not None:
+            all_parts.append(guide.reshape(-1, 2))
+        all_points = np.concatenate(all_parts, axis=0)
+        mins = all_points.min(axis=0)
+        maxs = all_points.max(axis=0)
+        center = (mins + maxs) / 2.0
+        radius = max(maxs - mins) / 2.0
+        radius = max(radius, 1e-6) * 1.15
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+
+    ax.set_title("Trajectory Generation")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    return fig
+
+
+st.title("SWE 599 Trajectory Diffusion Demo")
+st.write(
+    "Generate LASA-style 2D demonstration trajectories with a diffusion model, compare them "
+    "with real demonstrations, and guide the displayed output with a sketch or start-goal pair."
+)
+
+with st.expander("How it works", expanded=False):
+    st.markdown(
+        """
+        1. LASA handwriting demonstrations are resampled to a fixed sequence length.
+        2. During training, Gaussian noise is added to normalized trajectories.
+        3. A PyTorch denoising network learns to predict the added noise.
+        4. Sampling starts from random noise and repeatedly denoises it into a trajectory.
+        5. If a checkpoint was trained with start-goal conditioning, those values are passed into the model. Otherwise, this app applies geometric guidance after sampling.
+        """
+    )
+
+checkpoint_options = list_checkpoints()
+checkpoint_labels = [str(path.relative_to(ROOT)) for path in checkpoint_options]
+
+with st.sidebar:
+    st.header("Generation")
+    if checkpoint_options:
+        selected_label = st.selectbox("Checkpoint", checkpoint_labels, index=0)
+        checkpoint_path = str(ROOT / selected_label)
+    else:
+        checkpoint_path = str(DEFAULT_CHECKPOINT)
+    checkpoint_path = st.text_input("Checkpoint path", value=checkpoint_path)
+
+    shape_name = st.selectbox("Reference LASA shape", SHAPE_OPTIONS, index=SHAPE_OPTIONS.index("Angle"))
+    num_samples = st.slider("Samples", min_value=1, max_value=30, value=10)
+    seed = st.number_input("Seed", min_value=0, max_value=10000, value=7, step=1)
+    speed = st.radio("Sampling speed", list(SPEED_PRESETS.keys()), index=2, horizontal=True)
+    timesteps = st.slider("Sampling timesteps", min_value=50, max_value=1000, value=SPEED_PRESETS[speed], step=50)
+    st.caption("Use Full for final-quality trajectories. Fast and Balanced are useful previews.")
+
+    st.header("Guidance")
+    use_start_goal = st.checkbox("Use start-goal guidance", value=True)
+    post_start_goal_strength = st.slider("Start-goal guide strength", 0.0, 1.0, 0.65, 0.05)
+    drawing_strength = st.slider("Drawing guide strength", 0.0, 1.0, 0.35, 0.05)
+
+    st.header("Display")
+    show_references = st.checkbox("Overlay real LASA demonstrations", value=True)
+    max_references = st.slider("Reference trajectories", 1, 7, 7)
+    fixed_limits = st.checkbox("Use fixed plot limits", value=True)
+    generate = st.button("Generate", type="primary")
+
+checkpoint = Path(checkpoint_path)
+
+if not checkpoint.exists():
+    st.error(f"Checkpoint not found: {checkpoint}")
+    st.stop()
+
+references = load_reference_trajectories(shape_name, 256)
+reference_preview = references[:max_references]
+default_start = references[0, 0, :]
+default_goal = references[0, -1, :]
+
+draw_col, condition_col, plot_col, info_col = st.columns([1, 0.8, 1.45, 0.8])
+
+with draw_col:
+    st.subheader("Draw")
+    st.write("Sketch one continuous path to guide the displayed generated trajectories.")
+
+    if st_canvas is None:
+        st.warning("Install `streamlit-drawable-canvas` to enable mouse drawing.")
+        drawing = None
+    else:
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 255, 255, 0)",
+            stroke_width=4,
+            stroke_color="#2563eb",
+            background_color="#ffffff",
+            height=CANVAS_SIZE,
+            width=CANVAS_SIZE,
+            drawing_mode="freedraw",
+            key="trajectory_canvas",
+        )
+        drawing = extract_drawn_points(canvas_result.json_data)
+
+    if drawing is None:
+        st.caption("No drawing detected.")
+    else:
+        st.caption(f"Captured {len(drawing)} drawing points.")
+
+with condition_col:
+    st.subheader("Start / Goal")
+    use_drawing_endpoints = st.checkbox("Use drawing endpoints", value=True, disabled=drawing is None)
+
+    if drawing is not None and use_drawing_endpoints:
+        guide_for_condition = map_drawing_to_sample_space(resample_points(drawing, 2), reference_preview)
+        start = guide_for_condition[0]
+        goal = guide_for_condition[-1]
+        st.caption("Using endpoints from the sketch.")
+    else:
+        start_x = st.number_input("Start x", value=float(default_start[0]))
+        start_y = st.number_input("Start y", value=float(default_start[1]))
+        goal_x = st.number_input("Goal x", value=float(default_goal[0]))
+        goal_y = st.number_input("Goal y", value=float(default_goal[1]))
+        start = np.asarray([start_x, start_y], dtype=np.float32)
+        goal = np.asarray([goal_x, goal_y], dtype=np.float32)
+
+    start_goal = np.concatenate([start, goal]).astype(np.float32) if use_start_goal else None
+
+if generate or "samples" not in st.session_state:
+    with st.spinner("Generating trajectories..."):
+        samples, metadata = generate_samples(
+            checkpoint_path=checkpoint,
+            num_samples=num_samples,
+            timesteps=timesteps,
+            seed=int(seed),
+            condition=start_goal,
+        )
+    st.session_state["samples"] = samples
+    st.session_state["metadata"] = metadata
+    st.session_state["start_goal"] = start_goal
+else:
+    samples = st.session_state["samples"]
+    metadata = st.session_state["metadata"]
+    start_goal = st.session_state.get("start_goal", start_goal)
+
+resampled_drawing = resample_points(drawing, samples.shape[1]) if drawing is not None else None
+display_samples, guide = apply_drawing_guidance(samples, resampled_drawing, drawing_strength)
+
+true_conditioning = metadata.get("cond_dim", 0) > 0 and start_goal is not None
+if start_goal is not None and not true_conditioning:
+    display_samples = apply_start_goal_guidance(display_samples, start_goal, post_start_goal_strength)
+
+with plot_col:
+    fig = plot_trajectories(display_samples, reference_preview, guide, show_references, fixed_limits)
+    st.pyplot(fig)
+
+    png_buffer = figure_to_png(fig)
+    st.download_button(
+        "Download plot PNG",
+        data=png_buffer,
+        file_name="trajectory_generation.png",
+        mime="image/png",
+    )
+    st.download_button(
+        "Download trajectories CSV",
+        data=samples_to_csv(display_samples),
+        file_name="generated_trajectories.csv",
+        mime="text/csv",
+    )
+
+with info_col:
+    st.subheader("Metrics")
+    endpoint = endpoint_error(display_samples, start_goal)
+    nearest = nearest_reference_distance(display_samples, reference_preview)
+
+    st.metric("Generated", len(display_samples))
+    st.metric("Smoothness", f"{trajectory_smoothness(display_samples):.4f}")
+    st.metric("Curvature", f"{mean_curvature(display_samples):.4f}")
+    if endpoint is not None:
+        st.metric("Endpoint error", f"{endpoint:.4f}")
+    if nearest is not None:
+        st.metric("Nearest demo dist.", f"{nearest:.4f}")
+
+    st.subheader("Model")
+    history = checkpoint_history(metadata)
+    final_loss = final_metric_value(history["loss"]["train"])
+    final_val_loss = final_metric_value(history["loss"]["validation"])
+    st.json(
+        {
+            "shape_name": metadata.get("shape_name", "unknown"),
+            "seq_len": metadata.get("seq_len", samples.shape[1]),
+            "timesteps": metadata.get("timesteps", "unknown"),
+            "hidden": metadata.get("hidden", "unknown"),
+            "conditioning": metadata.get("conditioning", "none"),
+            "condition_used": "learned" if true_conditioning else "geometric" if start_goal is not None else "none",
+            "final_loss": final_loss,
+            "final_val_loss": final_val_loss,
+            "final_accuracy": final_metric_value(history["accuracy"]["train"]),
+            "final_val_accuracy": final_metric_value(history["accuracy"]["validation"]),
+            "final_f1": final_metric_value(history["f1"]["train"]),
+            "final_val_f1": final_metric_value(history["f1"]["validation"]),
+        }
+    )
+
+training_metrics_tab, generated_data_tab, reference_data_tab = st.tabs(
+    ["Training Metrics", "Generated Data", "Reference Data"]
+)
+
+with training_metrics_tab:
+    st.subheader("Training and Validation Curves")
+    st.write(
+        "Loss is the main diffusion training metric. Accuracy and F1 are proxy "
+        "classification metrics computed by checking whether the denoiser predicts "
+        "the correct sign of each noise coordinate."
+    )
+
+    history = checkpoint_history(metadata)
+    metric_definitions = metadata.get("metric_definitions") or {
+        "loss": "Mean squared error between predicted and true diffusion noise.",
+        "accuracy": "Proxy metric: fraction of noise coordinates with the correct predicted sign.",
+        "f1": "Proxy metric: F1 score after binarizing each noise coordinate by sign.",
+    }
+
+    metric_cols = st.columns(3)
+    metric_cols[0].metric(
+        "Final train loss",
+        f"{final_metric_value(history['loss']['train']):.4f}" if history["loss"]["train"] else "n/a",
+    )
+    metric_cols[1].metric(
+        "Final val accuracy",
+        f"{final_metric_value(history['accuracy']['validation']):.4f}"
+        if history["accuracy"]["validation"]
+        else "n/a",
+    )
+    metric_cols[2].metric(
+        "Final val F1",
+        f"{final_metric_value(history['f1']['validation']):.4f}" if history["f1"]["validation"] else "n/a",
+    )
+
+    if not history["loss"]["validation"] or not history["accuracy"]["train"] or not history["f1"]["train"]:
+        st.info(
+            "This checkpoint was trained before the full metric history was added, "
+            "so some plots may show only training loss. Retrain with the updated "
+            "`train.py` to store validation loss, accuracy, and F1 curves."
+        )
+
+    loss_col, acc_col, f1_col = st.columns(3)
+    with loss_col:
+        st.pyplot(plot_metric_history(history["loss"]))
+    with acc_col:
+        st.pyplot(plot_metric_history(history["accuracy"]))
+    with f1_col:
+        st.pyplot(plot_metric_history(history["f1"]))
+
+    st.write("Metric definitions")
+    st.dataframe(
+        pd.DataFrame(
+            [{"metric": name, "definition": definition} for name, definition in metric_definitions.items()]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    history_df = metric_history_dataframe(history)
+    st.write("Metric history DataFrame")
+    if history_df.empty:
+        st.warning("No training metric history was found in this checkpoint.")
+    else:
+        st.dataframe(history_df, width="stretch", height=360)
+        st.download_button(
+            "Download metric history CSV",
+            data=history_df.to_csv(index=False).encode("utf-8"),
+            file_name="training_metric_history.csv",
+            mime="text/csv",
+        )
+
+with generated_data_tab:
+    st.subheader("Generated Trajectory DataFrame")
+    st.write(
+        "Each row is one point from one displayed generated trajectory. "
+        "`sample` identifies which trajectory the point belongs to, `t` is the "
+        "time-step index, and `x`, `y` are the 2D coordinates."
+    )
+
+    generated_df = trajectories_to_dataframe(display_samples, "generated")
+    generated_summary_df = trajectory_summary_dataframe(display_samples, "generated")
+
+    info_col_a, info_col_b, info_col_c, info_col_d = st.columns(4)
+    info_col_a.metric("Rows", len(generated_df))
+    info_col_b.metric("Columns", len(generated_df.columns))
+    info_col_c.metric("Samples", generated_df["sample"].nunique())
+    info_col_d.metric("Steps", generated_df["t"].nunique())
+
+    visual_col, chart_col = st.columns([1.45, 1])
+    with visual_col:
+        st.write("Visual trajectory summary")
+        st.dataframe(
+            generated_summary_df,
+            width="stretch",
+            height=300,
+            column_config=visual_table_config(),
+        )
+    with chart_col:
+        st.write("Trajectory preview")
+        st.pyplot(plot_dataframe_preview(display_samples, "Generated Trajectories", "#2563eb"))
+
+    st.write("Point-level DataFrame")
+    st.dataframe(generated_df, width="stretch", height=360)
+
+    st.write("DataFrame summary")
+    st.dataframe(dataframe_info(generated_df), width="stretch")
+
+    st.write("Coordinate statistics")
+    st.dataframe(generated_df[["x", "y"]].describe(), width="stretch")
+
+    st.download_button(
+        "Download displayed DataFrame CSV",
+        data=generated_df.to_csv(index=False).encode("utf-8"),
+        file_name="displayed_generated_trajectories.csv",
+        mime="text/csv",
+    )
+
+with reference_data_tab:
+    st.subheader("Real LASA Reference DataFrame")
+    st.write(
+        "This table shows the real LASA demonstrations currently used as the gray "
+        "reference overlay. It is useful for comparing generated coordinates against "
+        "the demonstration data."
+    )
+
+    reference_df = trajectories_to_dataframe(reference_preview, "real_lasa")
+    reference_summary_df = trajectory_summary_dataframe(reference_preview, "real_lasa")
+
+    ref_col_a, ref_col_b, ref_col_c, ref_col_d = st.columns(4)
+    ref_col_a.metric("Rows", len(reference_df))
+    ref_col_b.metric("Columns", len(reference_df.columns))
+    ref_col_c.metric("Demos", reference_df["sample"].nunique())
+    ref_col_d.metric("Steps", reference_df["t"].nunique())
+
+    ref_visual_col, ref_chart_col = st.columns([1.45, 1])
+    with ref_visual_col:
+        st.write("Visual demonstration summary")
+        st.dataframe(
+            reference_summary_df,
+            width="stretch",
+            height=300,
+            column_config=visual_table_config(),
+        )
+    with ref_chart_col:
+        st.write("Demonstration preview")
+        st.pyplot(plot_dataframe_preview(reference_preview, "Real LASA Demonstrations", "#94a3b8"))
+
+    st.write("Point-level DataFrame")
+    st.dataframe(reference_df, width="stretch", height=360)
+
+    st.write("DataFrame summary")
+    st.dataframe(dataframe_info(reference_df), width="stretch")
+
+    st.write("Coordinate statistics")
+    st.dataframe(reference_df[["x", "y"]].describe(), width="stretch")

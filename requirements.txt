@@ -1,0 +1,8 @@
+numpy>=1.24
+matplotlib>=3.7
+pandas>=1.4
+torch>=2.0
+tqdm>=4.66
+streamlit>=1.34
+streamlit-drawable-canvas>=0.9.3
+pyLasaDataset>=0.1.1

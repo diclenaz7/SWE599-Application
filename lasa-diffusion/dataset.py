@@ -5,7 +5,8 @@ import pyLasaDataset as lasa
 
 
 class LASATrajectoryDataset(Dataset):
-    def __init__(self, shape_name="Angle", seq_len=256):
+    def __init__(self, shape_name="Angle", seq_len=256, conditioning="none"):
+        self.conditioning = conditioning
         data = getattr(lasa.DataSet, shape_name)
 
         trajectories = []
@@ -34,4 +35,10 @@ class LASATrajectoryDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return torch.tensor(self.data[idx])
+        trajectory = torch.tensor(self.data[idx])
+
+        if self.conditioning == "start-goal":
+            condition = torch.cat([trajectory[0], trajectory[-1]])
+            return trajectory, condition
+
+        return trajectory

@@ -20,13 +20,15 @@ class Diffusion:
         return noisy, noise
 
     @torch.no_grad()
-    def sample(self, model, shape):
+    def sample(self, model, shape, condition=None):
         x = torch.randn(shape).to(self.device)
+        if condition is not None:
+            condition = condition.to(self.device)
 
         for t in reversed(range(self.timesteps)):
             t_batch = torch.full((shape[0],), t, device=self.device, dtype=torch.long)
 
-            predicted_noise = model(x, t_batch)
+            predicted_noise = model(x, t_batch, condition=condition)
 
             beta = self.betas[t]
             alpha = self.alphas[t]
