@@ -31,6 +31,23 @@ that existing environment for the model scripts.
 
 ## Train
 
+Recommended multi-shape training:
+
+```bash
+cd lasa-diffusion
+python train.py --curated-shapes --seq-len 128 --epochs 10000 --batch-size 16 --timesteps 1000 --hidden 256 --conditioning start-goal --architecture temporal-conv
+```
+
+The curated training subset is:
+
+```text
+Angle, CShape, GShape, JShape, LShape, Sine, Spoon, WShape
+```
+
+This command saves to `lasa-diffusion/outputs/multi_shape_temporal_conv/` by default.
+
+Single-shape training is still available:
+
 ```bash
 cd lasa-diffusion
 python train.py --shape-name Angle --seq-len 128 --epochs 10000 --batch-size 7 --timesteps 1000 --hidden 256 --conditioning start-goal --architecture temporal-conv --output-dir outputs/temporal_conv_metrics
@@ -52,6 +69,10 @@ python train.py --shape-name Angle --epochs 3000 --batch-size 7 --conditioning s
 
 Training saves:
 
+- `lasa-diffusion/outputs/multi_shape_temporal_conv/lasa_diffusion.pt`
+- `lasa-diffusion/outputs/multi_shape_temporal_conv/loss.png`
+- `lasa-diffusion/outputs/multi_shape_temporal_conv/accuracy.png`
+- `lasa-diffusion/outputs/multi_shape_temporal_conv/f1.png`
 - `lasa-diffusion/outputs/temporal_conv_metrics/lasa_diffusion.pt`
 - `lasa-diffusion/outputs/temporal_conv_metrics/loss.png`
 - `lasa-diffusion/outputs/temporal_conv_metrics/accuracy.png`
@@ -61,7 +82,7 @@ Training saves:
 
 ```bash
 cd lasa-diffusion
-python sample.py --checkpoint outputs/temporal_conv_metrics/lasa_diffusion.pt --num-samples 10 --timesteps 1000
+python sample.py --checkpoint outputs/multi_shape_temporal_conv/lasa_diffusion.pt --num-samples 10 --timesteps 1000
 ```
 
 Sampling saves:
@@ -74,16 +95,17 @@ Sampling saves:
 ./lasa-diffusion/venv/bin/streamlit run webapp/app.py
 ```
 
-The app prefers `lasa-diffusion/outputs/temporal_conv_metrics/lasa_diffusion.pt` when it
-exists, then falls back to older checkpoints.
+The app prefers `lasa-diffusion/outputs/multi_shape_temporal_conv/lasa_diffusion.pt`
+when it exists, then falls back to older checkpoints.
 
 The app includes:
 
 - mouse drawing for trajectory guidance
-- optional start/goal guidance
+- fixed start/goal guidance from the sketch endpoints or default reference endpoints
 - real LASA demonstration overlays
-- LASA shape and checkpoint selectors
-- fast/balanced/full sampling presets
+- checkpoint selection
+- checkbox filters for the LASA shapes used by the selected checkpoint
+- simplified demo controls for sample count, variation, and sketch influence
 - trajectory metrics
 - training/validation metric plots from the selected checkpoint
 - PNG and CSV export buttons

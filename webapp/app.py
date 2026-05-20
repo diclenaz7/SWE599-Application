@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import torch
 
 try:
     from streamlit_drawable_canvas import st_canvas
@@ -20,7 +21,27 @@ except ImportError:
 DIFFUSION_DIR = ROOT / "lasa-diffusion"
 sys.path.insert(0, str(DIFFUSION_DIR))
 
-from dataset import LASATrajectoryDataset  # noqa: E402
+DEFAULT_TRAINING_SHAPES = [
+    "Angle",
+    "CShape",
+    "GShape",
+    "JShape",
+    "LShape",
+    "Sine",
+    "Spoon",
+    "WShape",
+]
+
+
+def load_dataset_class():
+    sys.modules.pop("dataset", None)
+    spec = importlib.util.spec_from_file_location("lasa_diffusion_dataset_runtime", DIFFUSION_DIR / "dataset.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.LASATrajectoryDataset
+
+
+LASATrajectoryDataset = load_dataset_class()
 
 
 def load_generate_samples():
@@ -36,42 +57,13 @@ def load_generate_samples():
 generate_samples = load_generate_samples()
 
 
-DEFAULT_CHECKPOINT = DIFFUSION_DIR / "outputs" / "lasa_diffusion.pt"
+DEFAULT_CHECKPOINT = DIFFUSION_DIR / "outputs" / "multi_shape_temporal_conv" / "lasa_diffusion.pt"
 CANVAS_SIZE = 420
-SPEED_PRESETS = {
-    "Fast": 50,
-    "Balanced": 250,
-    "Full": 1000,
-}
-SHAPE_OPTIONS = [
-    "Angle",
-    "BendedLine",
-    "CShape",
-    "DoubleBendedLine",
-    "GShape",
-    "heee",
-    "JShape",
-    "JShape_2",
-    "Khamesh",
-    "Leaf_1",
-    "Leaf_2",
-    "Line",
-    "LShape",
-    "NShape",
-    "PShape",
-    "RShape",
-    "Saeghe",
-    "Sharpc",
-    "Sine",
-    "Snake",
-    "Spoon",
-    "Sshape",
-    "Trapezoid",
-    "Worm",
-    "WShape",
-    "Zshape",
-]
-
+DEFAULT_NUM_SAMPLES = 6
+DEFAULT_TIMESTEPS = 1000
+DEFAULT_DRAWING_STRENGTH = 0.35
+DEFAULT_START_GOAL_STRENGTH = 0.65
+DEFAULT_REFERENCE_COUNT = 12
 
 st.set_page_config(page_title="SWE 599 Trajectory Diffusion Demo", layout="wide")
 
@@ -80,13 +72,15 @@ def list_checkpoints():
     checkpoints = sorted(DIFFUSION_DIR.glob("outputs/**/*.pt"))
 
     def checkpoint_priority(path):
-        if "temporal_conv_metrics" in path.parts:
+        if "multi_shape_temporal_conv" in path.parts:
             return (0, str(path))
-        if "temporal_conv" in path.parts:
+        if "temporal_conv_metrics" in path.parts:
             return (1, str(path))
-        if "start_goal" in path.parts:
+        if "temporal_conv" in path.parts:
             return (2, str(path))
-        return (3, str(path))
+        if "start_goal" in path.parts:
+            return (3, str(path))
+        return (4, str(path))
 
     checkpoints = sorted(checkpoints, key=checkpoint_priority)
     if DEFAULT_CHECKPOINT.exists() and DEFAULT_CHECKPOINT not in checkpoints:
@@ -95,10 +89,37 @@ def list_checkpoints():
 
 
 @st.cache_data(show_spinner=False)
-def load_reference_trajectories(shape_name, seq_len):
-    dataset = LASATrajectoryDataset(shape_name=shape_name, seq_len=seq_len)
-    raw = dataset.data * dataset.std + dataset.mean
-    return raw.astype(np.float32)
+def load_checkpoint_metadata(checkpoint_path, modified_time):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return {
+        "shape_name": checkpoint.get("shape_name"),
+        "shape_names": checkpoint.get("shape_names"),
+        "shape_counts": checkpoint.get("shape_counts"),
+        "seq_len": checkpoint.get("seq_len"),
+        "timesteps": checkpoint.get("timesteps"),
+        "hidden": checkpoint.get("hidden"),
+        "architecture": checkpoint.get("architecture"),
+        "conditioning": checkpoint.get("conditioning"),
+        "cond_dim": checkpoint.get("cond_dim", 0),
+    }
+
+
+def checkpoint_shape_names(metadata):
+    shape_names = metadata.get("shape_names")
+    if shape_names:
+        return list(shape_names)
+
+    shape_name = metadata.get("shape_name")
+    if shape_name and shape_name != "multi_shape":
+        return [shape_name]
+
+    return list(DEFAULT_TRAINING_SHAPES)
+
+
+@st.cache_data(show_spinner=False)
+def load_reference_trajectories(shape_names, seq_len):
+    dataset = LASATrajectoryDataset(shape_names=list(shape_names), seq_len=seq_len)
+    return dataset.raw_data.astype(np.float32), dataset.shape_labels.tolist(), dataset.shape_counts
 
 
 def extract_drawn_points(canvas_json):
@@ -223,19 +244,20 @@ def endpoint_error(samples, start_goal):
     return float(np.mean((start_error + goal_error) / 2.0))
 
 
-def trajectories_to_dataframe(trajectories, source):
+def trajectories_to_dataframe(trajectories, source, shape_labels=None):
     rows = []
     for sample_idx, trajectory in enumerate(trajectories):
         for t, point in enumerate(trajectory):
-            rows.append(
-                {
-                    "source": source,
-                    "sample": sample_idx,
-                    "t": t,
-                    "x": float(point[0]),
-                    "y": float(point[1]),
-                }
-            )
+            row = {
+                "source": source,
+                "sample": sample_idx,
+                "t": t,
+                "x": float(point[0]),
+                "y": float(point[1]),
+            }
+            if shape_labels is not None:
+                row["shape"] = shape_labels[sample_idx]
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -256,26 +278,27 @@ def dataframe_info(dataframe):
     )
 
 
-def trajectory_summary_dataframe(trajectories, source):
+def trajectory_summary_dataframe(trajectories, source, shape_labels=None):
     rows = []
     for sample_idx, trajectory in enumerate(trajectories):
         segment_lengths = np.linalg.norm(np.diff(trajectory, axis=0), axis=1)
         displacement = np.linalg.norm(trajectory[-1] - trajectory[0])
-        rows.append(
-            {
-                "source": source,
-                "sample": sample_idx,
-                "points": len(trajectory),
-                "start_x": float(trajectory[0, 0]),
-                "start_y": float(trajectory[0, 1]),
-                "goal_x": float(trajectory[-1, 0]),
-                "goal_y": float(trajectory[-1, 1]),
-                "path_length": float(segment_lengths.sum()),
-                "displacement": float(displacement),
-                "x_profile": trajectory[:, 0].round(3).tolist(),
-                "y_profile": trajectory[:, 1].round(3).tolist(),
-            }
-        )
+        row = {
+            "source": source,
+            "sample": sample_idx,
+            "points": len(trajectory),
+            "start_x": float(trajectory[0, 0]),
+            "start_y": float(trajectory[0, 1]),
+            "goal_x": float(trajectory[-1, 0]),
+            "goal_y": float(trajectory[-1, 1]),
+            "path_length": float(segment_lengths.sum()),
+            "displacement": float(displacement),
+            "x_profile": trajectory[:, 0].round(3).tolist(),
+            "y_profile": trajectory[:, 1].round(3).tolist(),
+        }
+        if shape_labels is not None:
+            row["shape"] = shape_labels[sample_idx]
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -440,7 +463,8 @@ with st.expander("How it works", expanded=False):
         2. During training, Gaussian noise is added to normalized trajectories.
         3. A PyTorch denoising network learns to predict the added noise.
         4. Sampling starts from random noise and repeatedly denoises it into a trajectory.
-        5. If a checkpoint was trained with start-goal conditioning, those values are passed into the model. Otherwise, this app applies geometric guidance after sampling.
+        5. The reference overlays are loaded from the same LASA shapes stored in the selected checkpoint metadata.
+        6. If a checkpoint was trained with start-goal conditioning, those values are passed into the model. Otherwise, this app applies geometric guidance after sampling.
         """
     )
 
@@ -454,24 +478,15 @@ with st.sidebar:
         checkpoint_path = str(ROOT / selected_label)
     else:
         checkpoint_path = str(DEFAULT_CHECKPOINT)
-    checkpoint_path = st.text_input("Checkpoint path", value=checkpoint_path)
 
-    shape_name = st.selectbox("Reference LASA shape", SHAPE_OPTIONS, index=SHAPE_OPTIONS.index("Angle"))
-    num_samples = st.slider("Samples", min_value=1, max_value=30, value=10)
-    seed = st.number_input("Seed", min_value=0, max_value=10000, value=7, step=1)
-    speed = st.radio("Sampling speed", list(SPEED_PRESETS.keys()), index=2, horizontal=True)
-    timesteps = st.slider("Sampling timesteps", min_value=50, max_value=1000, value=SPEED_PRESETS[speed], step=50)
-    st.caption("Use Full for final-quality trajectories. Fast and Balanced are useful previews.")
+    num_samples = st.slider("Generated trajectories", min_value=3, max_value=12, value=DEFAULT_NUM_SAMPLES)
+    variation = st.slider("Variation", min_value=1, max_value=10, value=1)
 
     st.header("Guidance")
-    use_start_goal = st.checkbox("Use start-goal guidance", value=True)
-    post_start_goal_strength = st.slider("Start-goal guide strength", 0.0, 1.0, 0.65, 0.05)
-    drawing_strength = st.slider("Drawing guide strength", 0.0, 1.0, 0.35, 0.05)
+    drawing_strength = st.slider("Sketch influence", 0.0, 1.0, DEFAULT_DRAWING_STRENGTH, 0.05)
 
     st.header("Display")
     show_references = st.checkbox("Overlay real LASA demonstrations", value=True)
-    max_references = st.slider("Reference trajectories", 1, 7, 7)
-    fixed_limits = st.checkbox("Use fixed plot limits", value=True)
     generate = st.button("Generate", type="primary")
 
 checkpoint = Path(checkpoint_path)
@@ -480,10 +495,38 @@ if not checkpoint.exists():
     st.error(f"Checkpoint not found: {checkpoint}")
     st.stop()
 
-references = load_reference_trajectories(shape_name, 256)
-reference_preview = references[:max_references]
-default_start = references[0, 0, :]
-default_goal = references[0, -1, :]
+preview_metadata = load_checkpoint_metadata(str(checkpoint), checkpoint.stat().st_mtime)
+trained_shape_names = checkpoint_shape_names(preview_metadata)
+references, reference_labels, shape_counts = load_reference_trajectories(tuple(trained_shape_names), 256)
+
+with st.sidebar:
+    st.header("Training Shapes")
+    st.caption("Choose which trained LASA shapes to show as real reference overlays.")
+    selected_shape_names = []
+    for shape in trained_shape_names:
+        demo_count = int(shape_counts.get(shape, 0))
+        if st.checkbox(f"{shape} ({demo_count})", value=True, key=f"shape_filter_{checkpoint}_{shape}"):
+            selected_shape_names.append(shape)
+
+    if not selected_shape_names:
+        st.warning("Select at least one training shape. Showing all shapes for now.")
+        selected_shape_names = list(trained_shape_names)
+
+reference_mask = np.isin(np.asarray(reference_labels), selected_shape_names)
+filtered_references = references[reference_mask]
+filtered_reference_labels = [label for label, keep in zip(reference_labels, reference_mask) if keep]
+if len(filtered_references) == 0:
+    filtered_references = references
+    filtered_reference_labels = list(reference_labels)
+
+with st.sidebar:
+    max_references = min(DEFAULT_REFERENCE_COUNT, len(filtered_references))
+    st.caption(f"Showing {max_references} reference demonstrations from {len(selected_shape_names)} shape(s).")
+
+reference_preview = filtered_references[:max_references]
+reference_label_preview = filtered_reference_labels[:max_references]
+default_start = reference_preview[0, 0, :]
+default_goal = reference_preview[0, -1, :]
 
 draw_col, condition_col, plot_col, info_col = st.columns([1, 0.8, 1.45, 0.8])
 
@@ -514,35 +557,48 @@ with draw_col:
 
 with condition_col:
     st.subheader("Start / Goal")
-    use_drawing_endpoints = st.checkbox("Use drawing endpoints", value=True, disabled=drawing is None)
 
-    if drawing is not None and use_drawing_endpoints:
+    if drawing is not None:
         guide_for_condition = map_drawing_to_sample_space(resample_points(drawing, 2), reference_preview)
         start = guide_for_condition[0]
         goal = guide_for_condition[-1]
         st.caption("Using endpoints from the sketch.")
     else:
-        start_x = st.number_input("Start x", value=float(default_start[0]))
-        start_y = st.number_input("Start y", value=float(default_start[1]))
-        goal_x = st.number_input("Goal x", value=float(default_goal[0]))
-        goal_y = st.number_input("Goal y", value=float(default_goal[1]))
-        start = np.asarray([start_x, start_y], dtype=np.float32)
-        goal = np.asarray([goal_x, goal_y], dtype=np.float32)
+        start = default_start.astype(np.float32)
+        goal = default_goal.astype(np.float32)
+        st.caption("Using endpoints from the first reference demonstration.")
 
-    start_goal = np.concatenate([start, goal]).astype(np.float32) if use_start_goal else None
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {"point": "start", "x": float(start[0]), "y": float(start[1])},
+                {"point": "goal", "x": float(goal[0]), "y": float(goal[1])},
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
 
-if generate or "samples" not in st.session_state:
+    start_goal = np.concatenate([start, goal]).astype(np.float32)
+
+checkpoint_changed = st.session_state.get("checkpoint_path") != str(checkpoint)
+settings = (str(checkpoint), int(num_samples), int(variation), tuple(selected_shape_names))
+settings_changed = st.session_state.get("generation_settings") != settings
+
+if generate or "samples" not in st.session_state or checkpoint_changed or settings_changed:
     with st.spinner("Generating trajectories..."):
         samples, metadata = generate_samples(
             checkpoint_path=checkpoint,
             num_samples=num_samples,
-            timesteps=timesteps,
-            seed=int(seed),
+            timesteps=DEFAULT_TIMESTEPS,
+            seed=int(variation),
             condition=start_goal,
         )
     st.session_state["samples"] = samples
     st.session_state["metadata"] = metadata
     st.session_state["start_goal"] = start_goal
+    st.session_state["checkpoint_path"] = str(checkpoint)
+    st.session_state["generation_settings"] = settings
 else:
     samples = st.session_state["samples"]
     metadata = st.session_state["metadata"]
@@ -553,10 +609,10 @@ display_samples, guide = apply_drawing_guidance(samples, resampled_drawing, draw
 
 true_conditioning = metadata.get("cond_dim", 0) > 0 and start_goal is not None
 if start_goal is not None and not true_conditioning:
-    display_samples = apply_start_goal_guidance(display_samples, start_goal, post_start_goal_strength)
+    display_samples = apply_start_goal_guidance(display_samples, start_goal, DEFAULT_START_GOAL_STRENGTH)
 
 with plot_col:
-    fig = plot_trajectories(display_samples, reference_preview, guide, show_references, fixed_limits)
+    fig = plot_trajectories(display_samples, reference_preview, guide, show_references, fixed_limits=True)
     st.pyplot(fig)
 
     png_buffer = figure_to_png(fig)
@@ -593,6 +649,7 @@ with info_col:
     st.json(
         {
             "shape_name": metadata.get("shape_name", "unknown"),
+            "shape_names": checkpoint_shape_names(metadata),
             "seq_len": metadata.get("seq_len", samples.shape[1]),
             "timesteps": metadata.get("timesteps", "unknown"),
             "hidden": metadata.get("hidden", "unknown"),
@@ -726,15 +783,29 @@ with generated_data_tab:
     )
 
 with reference_data_tab:
-    st.subheader("Real LASA Reference DataFrame")
+    st.subheader("Real LASA Training-Shape Reference DataFrame")
     st.write(
-        "This table shows the real LASA demonstrations currently used as the gray "
-        "reference overlay. It is useful for comparing generated coordinates against "
-        "the demonstration data."
+        "This table shows real LASA demonstrations from the shapes stored in the selected "
+        "checkpoint. Checkbox selections in the sidebar control which shape references "
+        "are used for the gray overlay and for "
+        "nearest-demonstration comparison."
     )
 
-    reference_df = trajectories_to_dataframe(reference_preview, "real_lasa")
-    reference_summary_df = trajectory_summary_dataframe(reference_preview, "real_lasa")
+    shape_count_df = pd.DataFrame(
+        [
+            {
+                "shape": shape,
+                "demos": int(shape_counts.get(shape, 0)),
+                "shown": shape in selected_shape_names,
+            }
+            for shape in trained_shape_names
+        ]
+    )
+    st.write("Training shapes represented by the selected checkpoint")
+    st.dataframe(shape_count_df, width="stretch", hide_index=True)
+
+    reference_df = trajectories_to_dataframe(reference_preview, "real_lasa", reference_label_preview)
+    reference_summary_df = trajectory_summary_dataframe(reference_preview, "real_lasa", reference_label_preview)
 
     ref_col_a, ref_col_b, ref_col_c, ref_col_d = st.columns(4)
     ref_col_a.metric("Rows", len(reference_df))

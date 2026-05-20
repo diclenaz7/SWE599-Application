@@ -71,10 +71,11 @@ The current main model is stronger than the first version. It uses a compact
 temporal-convolution denoising network, so the trajectory is treated as an
 ordered sequence instead of only as one flattened vector.
 
-However, the model still has limited training data. A single LASA shape usually
-contains only a small number of demonstrations, so the model can still produce
-noisy, overly averaged, or blob-like trajectories when the sampling settings are
-too fast or the requested drawing is far from the training examples.
+However, the model still has limited training data. The recommended checkpoint is
+now trained on a curated subset of LASA shapes instead of only Angle, but each
+shape still contains only a small number of demonstrations. The model can still
+produce noisy, overly averaged, or blob-like trajectories when the sampling
+settings are too fast or the requested drawing is far from the training examples.
 
 A true sketch-conditioned model would be trained like this:
 
@@ -88,36 +89,40 @@ selected, but full sketch conditioning would require a stronger training setup.
 
 ## What the Controls Do
 
-## Samples
+The interface intentionally exposes only the controls that are meaningful during
+a project demonstration. Technical settings such as diffusion timesteps,
+start-goal correction strength, fixed plot limits, and reference count are fixed
+to stable values so the app produces cleaner and more consistent results.
+
+## Generated Trajectories
 
 Controls how many blue generated trajectories are shown.
 
 More samples gives more variety, but it can also make the plot crowded. For a
 clearer visual result, 3 to 5 samples are often easier to inspect than 10 or more.
 
-## Sampling Speed
+## Variation
 
-Controls how many denoising steps are used.
+Changes the random seed used for sampling.
 
-- **Fast** uses fewer denoising steps. It is quicker but usually lower quality.
-- **Balanced** is a middle option.
-- **Full** uses more denoising steps. It is slower but usually gives better
-  trajectories.
+This is a more understandable version of a raw seed input. Increasing it lets the
+user generate a different set of trajectories while keeping the result
+reproducible.
 
-## Drawing Guide Strength
+## Sketch Influence
 
 Controls how strongly the drawn sketch influences the displayed generated paths.
 
 A higher value makes the generated display move closer to the drawn guide.
 
-## Use Start-Goal Guidance
+## Start-Goal Guidance
 
-Uses a start point and goal point to guide generation.
+Start-goal guidance is always enabled because it is central to the demonstration.
 
 The start and goal can come from:
 
 - the endpoints of the drawing
-- manually entered coordinate values
+- the first real reference demonstration when no drawing is present
 
 If the checkpoint supports learned start/goal conditioning, the start and goal
 are passed into the model. Otherwise, the app applies geometric correction after
@@ -125,7 +130,14 @@ sampling.
 
 ## Overlay Real LASA Demonstrations
 
-Shows real trajectories from the LASA dataset as gray lines.
+Shows real trajectories from the LASA dataset as gray lines. The app now chooses
+these reference demonstrations from the shapes stored in the selected checkpoint,
+instead of asking the user to pick an unrelated reference shape.
+
+The sidebar also shows one checkbox for each training shape in the checkpoint.
+Checking or unchecking these shapes changes which real demonstrations are shown
+as references and used in the nearest-demonstration comparison. It does not
+retrain the model or change the checkpoint; it only changes the reference view.
 
 This helps compare generated trajectories against the data that the model is
 trying to imitate.
@@ -203,6 +215,7 @@ The columns are:
 ## Reference Data
 
 This tab shows the real LASA trajectories currently used as reference overlays.
+It also lists the LASA shapes represented by the selected checkpoint.
 
 It is useful for comparing generated coordinate ranges and statistics with the
 real demonstration data.
@@ -232,6 +245,7 @@ Current limitations include:
 
 - the model is still compact
 - the dataset for each LASA shape is small
+- the multi-shape checkpoint is not yet conditioned on an explicit shape label
 - full sketch conditioning is not yet learned
 - fast preview sampling can reduce trajectory quality
 - generated trajectories may be noisy
@@ -241,7 +255,7 @@ Current limitations include:
 Useful next steps would be:
 
 - condition directly on the full user sketch
-- train on multiple LASA shapes
+- add explicit shape-label conditioning for the multi-shape checkpoint
 - add better quantitative evaluation
 - improve trajectory smoothness
 - compare the temporal-conv checkpoint against the older MLP checkpoint

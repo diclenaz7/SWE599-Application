@@ -29,19 +29,26 @@ Class:
 Default dataset configuration:
 
 ```text
-shape_name = "Angle"
+shape_names = ["Angle"] for compatibility
+recommended_shape_names = ["Angle", "CShape", "GShape", "JShape", "LShape", "Sine", "Spoon", "WShape"]
 seq_len = 128
 trajectory_dim = 2
 ```
 
 Each LASA demonstration is originally loaded as 2D position data. The loader:
 
-1. Reads one LASA shape from `pyLasaDataset`.
+1. Reads one or more LASA shapes from `pyLasaDataset`.
 2. Converts each demonstration from shape `(2, T)` to `(T, 2)`.
 3. Resamples each trajectory to a fixed length of `128` points by default.
 4. Stacks all demonstrations into an array of shape `(N, 128, 2)`.
 5. Computes global dataset mean and standard deviation over trajectories and time.
 6. Normalizes the trajectories before training.
+
+The current recommended setup trains a single checkpoint on a curated subset of
+eight visually different LASA shapes: Angle, CShape, GShape, JShape, LShape,
+Sine, Spoon, and WShape. This gives the model more trajectory variety than the
+original Angle-only checkpoint while keeping the dataset small enough for fast
+experimentation.
 
 The checkpoint stores the dataset `mean` and `std` so generated samples can be
 converted back to the original coordinate scale.
@@ -161,7 +168,14 @@ Recommended training command:
 
 ```bash
 cd lasa-diffusion
-python train.py --shape-name Angle --seq-len 128 --epochs 10000 --batch-size 7 --timesteps 1000 --hidden 256 --conditioning start-goal --architecture temporal-conv --output-dir outputs/temporal_conv_metrics
+python train.py --curated-shapes --seq-len 128 --epochs 10000 --batch-size 16 --timesteps 1000 --hidden 256 --conditioning start-goal --architecture temporal-conv
+```
+
+Equivalent explicit multi-shape command:
+
+```bash
+cd lasa-diffusion
+python train.py --shape-names Angle CShape GShape JShape LShape Sine Spoon WShape --seq-len 128 --epochs 10000 --batch-size 16 --timesteps 1000 --hidden 256 --conditioning start-goal --architecture temporal-conv --output-dir outputs/multi_shape_temporal_conv
 ```
 
 Older MLP training command:
@@ -181,9 +195,9 @@ python train.py --shape-name Angle --epochs 5 --batch-size 7 --timesteps 100
 Default training hyperparameters:
 
 ```text
-shape_name = Angle
+shape_names = Angle, CShape, GShape, JShape, LShape, Sine, Spoon, WShape
 seq_len = 128
-batch_size = 7
+batch_size = 16 for the curated multi-shape checkpoint
 epochs = 10000 for the current trained temporal-conv checkpoint
 timesteps = 1000
 hidden = 256
@@ -227,7 +241,7 @@ important than classification accuracy.
 Current recommended checkpoint path:
 
 ```text
-lasa-diffusion/outputs/temporal_conv_metrics/lasa_diffusion.pt
+lasa-diffusion/outputs/multi_shape_temporal_conv/lasa_diffusion.pt
 ```
 
 The checkpoint stores:
@@ -237,6 +251,8 @@ model       - PyTorch model state dictionary
 mean        - dataset mean used for normalization
 std         - dataset standard deviation used for normalization
 shape_name  - LASA shape name used for training
+shape_names - list of LASA shape names used for training
+shape_counts - number of demonstrations loaded for each shape
 seq_len     - trajectory sequence length
 timesteps   - number of diffusion timesteps
 hidden      - hidden layer width
@@ -263,10 +279,10 @@ The checkpoint is used by:
 The training script saves:
 
 ```text
-lasa-diffusion/outputs/temporal_conv_metrics/lasa_diffusion.pt
-lasa-diffusion/outputs/temporal_conv_metrics/loss.png
-lasa-diffusion/outputs/temporal_conv_metrics/accuracy.png
-lasa-diffusion/outputs/temporal_conv_metrics/f1.png
+lasa-diffusion/outputs/multi_shape_temporal_conv/lasa_diffusion.pt
+lasa-diffusion/outputs/multi_shape_temporal_conv/loss.png
+lasa-diffusion/outputs/multi_shape_temporal_conv/accuracy.png
+lasa-diffusion/outputs/multi_shape_temporal_conv/f1.png
 ```
 
 The metric plots can be included in the final report. Checkpoints trained before
@@ -282,14 +298,14 @@ Default sampling command:
 
 ```bash
 cd lasa-diffusion
-python sample.py --checkpoint outputs/temporal_conv_metrics/lasa_diffusion.pt --num-samples 10 --timesteps 1000
+python sample.py --checkpoint outputs/multi_shape_temporal_conv/lasa_diffusion.pt --num-samples 10 --timesteps 1000
 ```
 
 Conditional sampling command for a start/goal checkpoint:
 
 ```bash
 cd lasa-diffusion
-python sample.py --checkpoint outputs/temporal_conv_metrics/lasa_diffusion.pt --num-samples 10 --timesteps 1000 --start -40 -3 --goal 0 0
+python sample.py --checkpoint outputs/multi_shape_temporal_conv/lasa_diffusion.pt --num-samples 10 --timesteps 1000 --start -40 -3 --goal 0 0
 ```
 
 Sampling starts from Gaussian noise:
@@ -324,18 +340,32 @@ Run command:
 
 The app allows the user to:
 
-- Select a checkpoint path.
-- Select a LASA reference shape.
+- Select a checkpoint.
+- See which LASA shapes were used to train the selected checkpoint.
+- Choose which trained shapes are shown as real reference overlays.
 - Choose the number of generated samples.
-- Choose a random seed.
-- Choose fast, balanced, or full sampling.
+- Choose a simple variation index for reproducible sampling diversity.
 - Draw a trajectory sketch.
-- Enter or sketch start and goal points.
+- Use sketch endpoints or default reference endpoints as start and goal points.
 - Overlay real LASA demonstrations.
 - Export the trajectory plot as PNG.
 - Export generated trajectories as CSV.
 - Inspect smoothness, curvature, endpoint error, and nearest-demonstration distance.
 - View generated trajectories and checkpoint metadata.
+
+The LASA reference-shape dropdown was removed because it could make the app show
+references from a shape that the selected model was not trained on. The app now
+loads reference demonstrations from the `shape_names` stored in the checkpoint
+and displays those shapes in the sidebar and reference-data tab. The sidebar
+uses one checkbox per trained shape, so the user can filter the reference overlay
+to selected shape families while still using the same trained checkpoint.
+
+Several low-level controls were also removed from the visible interface. The app
+now fixes diffusion sampling to `1000` timesteps, uses a stable start-goal guide
+strength, uses fixed plot limits, and shows a fixed number of reference
+demonstrations. This makes the app easier to present because the instructor can
+focus on the model output, drawing interaction, metrics, and data tables instead
+of tuning implementation-specific parameters.
 
 ## Current Scope and Limitations
 
@@ -347,7 +377,8 @@ Important limitations:
 
 - The current model is still compact and trained on a very small number of LASA
   demonstrations for each shape.
-- The default setup trains on one LASA shape at a time.
+- The recommended setup trains on a curated set of eight LASA shapes, but the
+  model is not yet conditioned on an explicit shape label.
 - The model supports learned start-goal conditioning, but it does not yet learn
   full sketch conditioning from the entire user drawing.
 - Fast and balanced app sampling use fewer reverse denoising steps, so full
@@ -357,7 +388,8 @@ Important limitations:
 
 Potential extensions:
 
-- Train on more LASA shapes and condition on the shape label.
+- Add explicit shape-label conditioning so the user can request a specific LASA
+  shape from a multi-shape checkpoint.
 - Replace the temporal convolution with a trajectory U-Net or Transformer.
 - Add trajectory metrics such as endpoint error, dynamic time warping distance,
   smoothness, and nearest-neighbor comparison to demonstrations.

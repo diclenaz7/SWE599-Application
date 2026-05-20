@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from dataset import LASATrajectoryDataset
+from dataset import DEFAULT_TRAINING_SHAPES, LASATrajectoryDataset
 from diffusion import Diffusion
 from model import TrajectoryDenoiser
 
@@ -20,6 +20,17 @@ from model import TrajectoryDenoiser
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a DDPM-style LASA trajectory model.")
     parser.add_argument("--shape-name", default="Angle", help="LASA shape name, e.g. Angle, Sine, Spoon.")
+    parser.add_argument(
+        "--shape-names",
+        nargs="+",
+        default=None,
+        help="Train on multiple LASA shapes, e.g. --shape-names Angle CShape Sine Spoon.",
+    )
+    parser.add_argument(
+        "--curated-shapes",
+        action="store_true",
+        help=f"Train on the curated multi-shape subset: {', '.join(DEFAULT_TRAINING_SHAPES)}.",
+    )
     parser.add_argument("--seq-len", type=int, default=128, help="Fixed trajectory length.")
     parser.add_argument("--batch-size", type=int, default=7, help="Training batch size.")
     parser.add_argument("--epochs", type=int, default=3000, help="Number of training epochs.")
@@ -42,6 +53,14 @@ def parse_args():
         help="Optional conditioning signal for training.",
     )
     return parser.parse_args()
+
+
+def selected_shape_names(args):
+    if args.curated_shapes:
+        return DEFAULT_TRAINING_SHAPES
+    if args.shape_names:
+        return args.shape_names
+    return [args.shape_name]
 
 
 def split_dataset(dataset, val_split, seed):
@@ -139,15 +158,22 @@ def plot_history(history, output_dir):
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
+    shape_names = selected_shape_names(args)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_dir = Path(args.output_dir)
+    if args.output_dir == "outputs" and len(shape_names) > 1:
+        output_dir = Path("outputs/multi_shape_temporal_conv")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = LASATrajectoryDataset(shape_name=args.shape_name, seq_len=args.seq_len, conditioning=args.conditioning)
+    dataset = LASATrajectoryDataset(shape_names=shape_names, seq_len=args.seq_len, conditioning=args.conditioning)
     train_dataset, val_dataset = split_dataset(dataset, args.val_split, args.seed)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False) if val_dataset is not None else None
+
+    print(f"Training shapes: {', '.join(shape_names)}")
+    print(f"Demonstrations per shape: {dataset.shape_counts}")
+    print(f"Total demonstrations: {len(dataset)}")
 
     cond_dim = 4 if args.conditioning == "start-goal" else 0
     model = TrajectoryDenoiser(
@@ -203,12 +229,15 @@ def main():
             print(message)
 
     checkpoint_path = output_dir / "lasa_diffusion.pt"
+    shape_name = shape_names[0] if len(shape_names) == 1 else "multi_shape"
     torch.save(
         {
             "model": model.state_dict(),
             "mean": dataset.mean,
             "std": dataset.std,
-            "shape_name": args.shape_name,
+            "shape_name": shape_name,
+            "shape_names": shape_names,
+            "shape_counts": dataset.shape_counts,
             "seq_len": args.seq_len,
             "timesteps": args.timesteps,
             "hidden": args.hidden,
