@@ -1,3 +1,8 @@
+# Use CPU-only PyTorch wheels. Streamlit Community Cloud has no GPU, and the
+# default CUDA build pulls in several GB of nvidia-* packages that exhaust the
+# free-tier disk/memory and make the app hang or crash during generation.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 numpy>=1.24
 matplotlib>=3.7
 pandas>=1.4
