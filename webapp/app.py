@@ -2,7 +2,6 @@ from pathlib import Path
 import importlib.util
 import io
 import os
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "lasa-diffusion" / ".mplconfig"))
@@ -19,7 +18,6 @@ except ImportError:
     st_canvas = None
 
 DIFFUSION_DIR = ROOT / "lasa-diffusion"
-sys.path.insert(0, str(DIFFUSION_DIR))
 
 DEFAULT_TRAINING_SHAPES = [
     "Angle",
@@ -33,11 +31,19 @@ DEFAULT_TRAINING_SHAPES = [
 ]
 
 
-def load_dataset_class():
-    sys.modules.pop("dataset", None)
-    spec = importlib.util.spec_from_file_location("lasa_diffusion_dataset_runtime", DIFFUSION_DIR / "dataset.py")
+def load_module_from_path(runtime_name, module_path):
+    module_path = Path(module_path).resolve()
+    spec = importlib.util.spec_from_file_location(runtime_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {runtime_name} from {module_path}")
+
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def load_dataset_class():
+    module = load_module_from_path("lasa_diffusion_dataset_runtime", DIFFUSION_DIR / "dataset.py")
     return module.LASATrajectoryDataset
 
 
@@ -45,12 +51,7 @@ LASATrajectoryDataset = load_dataset_class()
 
 
 def load_generate_samples():
-    for module_name in ["sample", "model", "diffusion"]:
-        sys.modules.pop(module_name, None)
-
-    spec = importlib.util.spec_from_file_location("lasa_diffusion_sample_runtime", DIFFUSION_DIR / "sample.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load_module_from_path("lasa_diffusion_sample_runtime", DIFFUSION_DIR / "sample.py")
     return module.generate_samples
 
 
@@ -122,6 +123,31 @@ def load_reference_trajectories(shape_names, seq_len):
     return dataset.raw_data.astype(np.float32), dataset.shape_labels.tolist(), dataset.shape_counts
 
 
+def select_reference_preview(references, reference_labels, selected_shape_names, max_count):
+    if len(references) <= max_count:
+        return references, list(reference_labels)
+
+    labels = np.asarray(reference_labels)
+    grouped_indices = [np.flatnonzero(labels == shape).tolist() for shape in selected_shape_names]
+    grouped_indices = [indices for indices in grouped_indices if indices]
+
+    selected_indices = []
+    offset = 0
+    while len(selected_indices) < max_count:
+        added_any = False
+        for indices in grouped_indices:
+            if offset < len(indices):
+                selected_indices.append(indices[offset])
+                added_any = True
+                if len(selected_indices) == max_count:
+                    break
+        if not added_any:
+            break
+        offset += 1
+
+    return references[selected_indices], [reference_labels[index] for index in selected_indices]
+
+
 def extract_drawn_points(canvas_json):
     if not canvas_json:
         return None
@@ -179,7 +205,8 @@ def apply_drawing_guidance(samples, drawing, strength):
         return samples, None
 
     guide = map_drawing_to_sample_space(drawing, samples)
-    guided = ((1.0 - strength) * samples) + (strength * guide[None, :, :])
+    blend_guide = smooth_trajectories(guide[None], sigma=2)[0]
+    guided = ((1.0 - strength) * samples) + (strength * blend_guide[None, :, :])
     return guided, guide
 
 
@@ -198,6 +225,26 @@ def apply_start_goal_guidance(samples, start_goal, strength):
     endpoint_guided = samples + correction
 
     return ((1.0 - strength) * samples) + (strength * (0.85 * endpoint_guided + 0.15 * target_line))
+
+
+def smooth_trajectories(samples, sigma=4):
+    """Apply Gaussian smoothing along the time axis of every trajectory.
+
+    Uses edge padding so the endpoints are preserved instead of being pulled
+    toward the origin by zero-padded convolution.
+    """
+    radius = int(3 * sigma) + 1
+    kernel_size = 2 * radius + 1
+    x = np.arange(kernel_size) - radius
+    kernel = np.exp(-0.5 * (x / sigma) ** 2)
+    kernel /= kernel.sum()
+
+    smoothed = np.empty_like(samples)
+    for i in range(samples.shape[0]):
+        for d in range(samples.shape[2]):
+            padded = np.pad(samples[i, :, d], radius, mode="edge")
+            smoothed[i, :, d] = np.convolve(padded, kernel, mode="valid")
+    return smoothed
 
 
 def trajectory_smoothness(trajectories):
@@ -523,8 +570,12 @@ with st.sidebar:
     max_references = min(DEFAULT_REFERENCE_COUNT, len(filtered_references))
     st.caption(f"Showing {max_references} reference demonstrations from {len(selected_shape_names)} shape(s).")
 
-reference_preview = filtered_references[:max_references]
-reference_label_preview = filtered_reference_labels[:max_references]
+reference_preview, reference_label_preview = select_reference_preview(
+    filtered_references,
+    filtered_reference_labels,
+    selected_shape_names,
+    max_references,
+)
 default_start = reference_preview[0, 0, :]
 default_goal = reference_preview[0, -1, :]
 
@@ -594,6 +645,7 @@ if generate or "samples" not in st.session_state or checkpoint_changed or settin
             seed=int(variation),
             condition=start_goal,
         )
+    samples = smooth_trajectories(samples)
     st.session_state["samples"] = samples
     st.session_state["metadata"] = metadata
     st.session_state["start_goal"] = start_goal

@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import os
 from pathlib import Path
 
@@ -11,8 +12,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from diffusion import Diffusion
-from model import TrajectoryDenoiser
+
+def load_sibling_module(module_name):
+    module_path = Path(__file__).resolve().with_name(f"{module_name}.py")
+    runtime_name = f"lasa_diffusion_{module_name}_runtime"
+
+    spec = importlib.util.spec_from_file_location(runtime_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {module_name} from {module_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+Diffusion = load_sibling_module("diffusion").Diffusion
+TrajectoryDenoiser = load_sibling_module("model").TrajectoryDenoiser
 
 
 def parse_args():
